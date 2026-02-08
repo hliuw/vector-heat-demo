@@ -34,6 +34,9 @@ float tCoef = 1.0;
 std::unique_ptr<VectorHeatMethodSolver> solver;
 int vertexInd = 0;
 int pCenter = 2;
+int randomVectorSize = 3;
+double randomScale = 0.2;
+double screeningWeight = 0.1;
 bool useIntrinsicTriangulation = true;
 std::unique_ptr<SignpostIntrinsicTriangulation> signpostTri;
 
@@ -48,6 +51,8 @@ struct SourceVert {
   float vectorAngleRad = 0.;
 };
 std::vector<SourceVert> extensionSourcePoints;
+
+std::vector<SourceVert> randomSourcePoints;
 
 // Manage a single source vertex for logmap
 Vertex logmapSourceVertex;
@@ -79,19 +84,19 @@ std::tuple<VertexData<Vector3>, VertexData<Vector3>> getTangentVectors() {
 }
 
 bool vizFirstRun = true;
-void updateSourceSetViz() {
+void updateSourceSetViz(std::vector<SourceVert> sourcePoints = extensionSourcePoints) {
 
   // Scalar balls around sources
   std::vector<Vector3> sourcePositions;
   std::vector<double> sourceValues;
-  for (SourceVert& s : extensionSourcePoints) {
+  for (SourceVert& s : sourcePoints) {
     size_t ind = geometry->vertexIndices[s.vertex];
     sourcePositions.push_back(geometry->inputVertexPositions[s.vertex]);
     sourceValues.push_back(s.scalarVal);
   }
   auto pointQ = polyscope::registerPointCloud("source points", sourcePositions);
   auto scalarQ = pointQ->addScalarQuantity("source scalars", sourceValues);
-  pointQ->setPointRadius(0.015);
+  pointQ->setPointRadius(0.003);
   scalarQ->setColorMap("reds");
   if (vizFirstRun) {
     scalarQ->setEnabled(true);
@@ -101,12 +106,12 @@ void updateSourceSetViz() {
   VertexData<Vector3> basisX, basisY;
   std::tie(basisX, basisY) = getTangentVectors();
   std::vector<Vector3> sourceVectors;
-  for (SourceVert& s : extensionSourcePoints) {
+  for (SourceVert& s : sourcePoints) {
     Vector2 vec = Vector2::fromAngle(s.vectorAngleRad) * s.vectorMag;
     Vector3 vec3D = basisX[s.vertex] * vec.x + basisY[s.vertex] * vec.y;
     sourceVectors.push_back(vec3D);
   }
-  auto vectorQ = pointQ->addVectorQuantity("source vectors", sourceVectors);
+  auto vectorQ = pointQ->addVectorQuantity("source vectors", sourceVectors, polyscope::VectorType::AMBIENT); // ignore scale
   vectorQ->setVectorLengthScale(.05);
   vectorQ->setVectorRadius(.005);
   vectorQ->setVectorColor(glm::vec3{227 / 255., 52 / 255., 28 / 255.});
@@ -414,6 +419,55 @@ void computeCenter() {
   pointQ->setPointRadius(0.02);
 }
 
+// generate random vector data for testing, save to randomSourcePoints
+void generateRandomSourcePoints(int numPoints) {
+  randomSourcePoints.clear();
+  for (int i = 0; i < numPoints; i++) {
+    SourceVert s;
+    s.vertex = mesh->vertex(rand() % mesh->nVertices());
+    s.scalarVal = static_cast<float>(rand()) / RAND_MAX;
+    s.vectorMag = static_cast<float>(rand()) / RAND_MAX * randomScale;
+    s.vectorAngleRad = static_cast<float>(rand()) / RAND_MAX * 2 * M_PI;
+    randomSourcePoints.push_back(s);
+  }
+}
+
+void smoothInterpolation() {
+
+  if (randomSourcePoints.size() == 0) {
+    polyscope::warning("no source points set");
+    return;
+  }
+  ensureHaveIntrinsicTriangulation();
+  // Prep the data, remap to intrinsic triangulation if using
+  std::vector<std::tuple<SurfacePoint, Vector2>> points;
+  for (SourceVert& s : randomSourcePoints) {
+    Vector2 vec = Vector2::fromAngle(s.vectorAngleRad) * s.vectorMag;
+    if (useIntrinsicTriangulation) {
+      // tangent spaces are aligned by construction
+      points.emplace_back(signpostTri->equivalentPointOnIntrinsic(SurfacePoint(s.vertex)).vertex, vec);
+    } else {
+      points.emplace_back(s.vertex, vec);
+    }
+  }
+
+  // Run the algorithm
+  VertexData<Vector2> vectorSmooth = solver->smoothestVectors(points, screeningWeight);
+
+  // Copy back to original mesh, if using intrinsic triangulation
+  if (useIntrinsicTriangulation) {
+    VertexData<Vector2> vectorSmoothOnInput = signpostTri->restrictToInput(vectorSmooth);
+    vectorSmooth = vectorSmoothOnInput;
+  }
+
+  VertexData<Vector3> basisX, basisY;
+  std::tie(basisX, basisY) = getTangentVectors();
+  auto vectorQ = psMesh->addVertexTangentVectorQuantity("extended vectors", vectorSmooth, basisX, basisY, 1, polyscope::VectorType::AMBIENT);
+  vectorQ->setEnabled(true);
+  //vectorQ->setVectorLengthScale(.05);
+}
+
+
 void buildPointsMenu() {
 
   bool anyChanged = false;
@@ -710,6 +764,30 @@ void myCallback() {
 
       if (ImGui::Button("find center")) {
         computeCenter();
+      }
+
+      ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem("Smooth Interpolation")) {
+      newUImode = "Smooth Interpolation";
+      psMesh->setSelectionMode(polyscope::MeshSelectionMode::Auto);
+
+      ImGui::TextWrapped("Generate several random generators and compute smoothest vector field interpolation");
+
+      ImGui::InputInt("num random vectors", &randomVectorSize);
+      ImGui::InputDouble("screening weight", &screeningWeight);
+      ImGui::InputDouble("random vector scale", &randomScale);
+
+      if (ImGui::Button("generate source points"))
+      {
+        generateRandomSourcePoints(randomVectorSize);
+        updateSourceSetViz(randomSourcePoints);
+      }
+
+      if (ImGui::Button("compute smooth interpolation"))
+      {
+        extensionSourcePoints = randomSourcePoints;
+        smoothInterpolation();
       }
 
       ImGui::EndTabItem();
