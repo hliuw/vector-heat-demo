@@ -17,9 +17,10 @@ See also the geometry-central documentation for [the Vector Heat Method](http://
 git clone --recurse-submodules https://github.com/nmwsharp/vector-heat-demo.git
 cd vector-heat-demo
 mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j4
-./bin/vector_heat /path/to/your/mesh.obj
+#cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake .. -DGC_EIGEN_LOCATION=C:/code/eigen-3.4.0
+#make -j4
+#./bin/vector_heat /path/to/your/mesh.obj
 ```
 
 This will open a UI window showing your mesh. The command window in the upper right can be used to run the algorithms, while the window on the left adjusts visualization setting. Note that both transport sources and averaging sites can be selected in these windows; some arbtrirary vertices are selected initially.
