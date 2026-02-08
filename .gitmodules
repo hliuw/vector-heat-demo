@@ -3,5 +3,5 @@
 	url = https://github.com/nmwsharp/polyscope.git
 [submodule "deps/geometry-central"]
 	path = deps/geometry-central
-	url = https://github.com/nmwsharp/geometry-central.git
+	url = git@github.com:hliuw/geometry-central.git
 	branch = v1
