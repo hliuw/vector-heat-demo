@@ -59,7 +59,7 @@ Vertex logmapSourceVertex;
 SurfacePoint logmapSourcePoint;
 bool logMapContinuous = false;
 Vector3 logmapContinuousLastXDir = Vector3{1., 0., 0.};
-Vector3 logmapContinuousLastNormal = Vector3{0., 0., 1.};
+Vector3 logmapContinuousLastNormal = Vector3{0., 0., 1.}; 
 VertexData<Vector2> lastLogmap;
 LogMapStrategy logMapStrategy = LogMapStrategy::AffineLocal;
 float logMapRadius = -1.;
