@@ -14,6 +14,8 @@
 #include "polyscope/polyscope.h"
 #include "polyscope/surface_mesh.h"
 
+#include "happly.h"
+
 #include "args/args.hxx"
 #include "imgui.h"
 
@@ -53,13 +55,16 @@ struct SourceVert {
 std::vector<SourceVert> extensionSourcePoints;
 
 std::vector<SourceVert> randomSourcePoints;
+std::vector<SourceVert> mishaSourcePoints;
+VertexData<Vector2> tempVectorField; // cached
+bool useMishaData = false;
 
 // Manage a single source vertex for logmap
 Vertex logmapSourceVertex;
 SurfacePoint logmapSourcePoint;
 bool logMapContinuous = false;
 Vector3 logmapContinuousLastXDir = Vector3{1., 0., 0.};
-Vector3 logmapContinuousLastNormal = Vector3{0., 0., 1.}; 
+Vector3 logmapContinuousLastNormal = Vector3{0., 0., 1.};
 VertexData<Vector2> lastLogmap;
 LogMapStrategy logMapStrategy = LogMapStrategy::AffineLocal;
 float logMapRadius = -1.;
@@ -111,7 +116,8 @@ void updateSourceSetViz(std::vector<SourceVert> sourcePoints = extensionSourcePo
     Vector3 vec3D = basisX[s.vertex] * vec.x + basisY[s.vertex] * vec.y;
     sourceVectors.push_back(vec3D);
   }
-  auto vectorQ = pointQ->addVectorQuantity("source vectors", sourceVectors, polyscope::VectorType::AMBIENT); // ignore scale
+  auto vectorQ =
+      pointQ->addVectorQuantity("source vectors", sourceVectors, polyscope::VectorType::AMBIENT); // ignore scale
   vectorQ->setVectorLengthScale(.05);
   vectorQ->setVectorRadius(.005);
   vectorQ->setVectorColor(glm::vec3{227 / 255., 52 / 255., 28 / 255.});
@@ -190,6 +196,143 @@ void addVertexSite(size_t ind) {
   centerSiteVerts.push_back(newV);
   updateSiteSetViz();
 }
+
+// read input mesh from Misha
+std::vector<std::pair<size_t, glm::vec3>> parseVectorFieldFromPly(const std::string& filename) {
+  // if not a PLY file return empty vector
+  if (filename.size() < 4 || filename.substr(filename.size() - 4) != ".ply") {
+    std::cerr << "Warning: input file " << filename << " is not a PLY file, skipping extrinsic vector field loading"
+              << std::endl;
+    return {};
+  }
+  // Read the PLY file
+  happly::PLYData plyIn(filename);
+
+  // Get the vertex element
+  auto& vertexElement = plyIn.getElement("vertex");
+
+  // Extract the three vector field components
+  std::vector<double> vf_0 = vertexElement.getProperty<double>("vf_0");
+  std::vector<double> vf_1 = vertexElement.getProperty<double>("vf_1");
+  std::vector<double> vf_2 = vertexElement.getProperty<double>("vf_2");
+
+  // Verify all vectors have the same size
+  if (vf_0.size() != vf_1.size() || vf_0.size() != vf_2.size()) {
+    throw std::runtime_error("Vector field components have mismatched sizes");
+  }
+
+  // Construct the output vector of glm::vec3, only including non-zero vectors
+  std::vector<std::pair<size_t, glm::vec3>> vectorField;
+
+  for (size_t i = 0; i < vf_0.size(); ++i) {
+    glm::vec3 vec(static_cast<float>(vf_0[i]), static_cast<float>(vf_1[i]), static_cast<float>(vf_2[i]));
+
+    // Only add non-zero vectors (check if any component is non-zero)
+    if (vec.x != 0.0f || vec.y != 0.0f || vec.z != 0.0f) {
+      vectorField.push_back(std::make_pair(i, vec));
+    }
+  }
+
+  return vectorField;
+}
+
+std::vector<SourceVert> projectExtrinsicVectors(std::vector<std::pair<size_t, glm::vec3>> extrinsicVecs) {
+  std::vector<SourceVert> result;
+  result.reserve(extrinsicVecs.size());
+
+  geometry->requireVertexNormals();
+
+  for (auto& [vertIdx, vec] : extrinsicVecs) {
+    Vertex v = mesh->vertex(vertIdx);
+
+    // Get the tangent basis vectors and normal at this vertex
+    Vector3 basisX = geometry->vertexTangentBasis[v][0];
+    Vector3 basisY = geometry->vertexTangentBasis[v][1];
+    Vector3 normal = geometry->vertexNormals[v];
+
+    // Convert the extrinsic 3D vector to a geometry-central Vector3
+    Vector3 extrinsicVec{vec.x, vec.y, vec.z};
+
+    // Check how perpendicular the vector is to the vertex normal
+    double vecNorm = norm(extrinsicVec);
+    if (vecNorm > 0.) {
+      double normalComponent = dot(extrinsicVec, normal) / vecNorm;
+      double angleFromTangentPlane = std::abs(std::asin(std::clamp(normalComponent, -1.0, 1.0)));
+      double angleDeg = angleFromTangentPlane * 180.0 / M_PI;
+      if (angleDeg > 2.0) {
+        std::cout << "Warning: vertex " << vertIdx << " extrinsic vector is " << angleDeg
+                  << " degrees from tangent plane (normal component ratio: " << normalComponent << ")" << std::endl;
+      }
+    }
+
+    // Project onto the tangent plane basis to get the 2D intrinsic coordinates
+    // Since basisX and basisY are orthonormal, projection is just dot products
+    double tangentX = dot(extrinsicVec, basisX);
+    double tangentY = dot(extrinsicVec, basisY);
+
+    // Convert from Cartesian (tangentX, tangentY) to polar (mag, angle)
+    Vector2 tangentVec{tangentX, tangentY};
+    double mag = norm(tangentVec);
+    double angle = std::atan2(tangentY, tangentX);
+
+    // std::cout << "Magnitude:" << mag << ", Angle (degrees): " << angle * 180.0 / M_PI << std::endl;
+
+    SourceVert s;
+    s.vertex = v;
+    s.scalarVal = static_cast<float>(mag);
+    s.vectorMag = static_cast<float>(mag);
+    s.vectorAngleRad = static_cast<float>(angle);
+    result.push_back(s);
+  }
+
+  return result;
+}
+
+void saveVertexVector2ToPly(const VertexData<Vector2>& vectorField, const std::string& filename) {
+  VertexData<Vector3> basisX, basisY;
+  std::tie(basisX, basisY) = getTangentVectors();
+
+  size_t nVertices = mesh->nVertices();
+  std::vector<std::array<double, 3>> vertexPositions(nVertices);
+  std::vector<float> vf0(nVertices), vf1(nVertices), vf2(nVertices);
+
+  for (Vertex v : mesh->vertices()) {
+    size_t idx = geometry->vertexIndices[v];
+    Vector3 pos = geometry->inputVertexPositions[v];
+    vertexPositions[idx] = {pos.x, pos.y, pos.z};
+
+    // Convert intrinsic 2D tangent vector back to extrinsic 3D
+    Vector2 tangentVec = vectorField[v];
+    Vector3 vec3D = basisX[v] * tangentVec.x + basisY[v] * tangentVec.y;
+    vf0[idx] = static_cast<float>(vec3D.x);
+    vf1[idx] = static_cast<float>(vec3D.y);
+    vf2[idx] = static_cast<float>(vec3D.z);
+  }
+
+  // Prepare face indices
+  std::vector<std::vector<size_t>> faceIndices;
+  faceIndices.reserve(mesh->nFaces());
+  for (Face f : mesh->faces()) {
+    std::vector<size_t> face;
+    for (Vertex v : f.adjacentVertices()) {
+      face.push_back(geometry->vertexIndices[v]);
+    }
+    faceIndices.push_back(face);
+  }
+
+  // Build PLY data using mesh helpers
+  happly::PLYData plyOut;
+  plyOut.addVertexPositions(vertexPositions);
+  plyOut.addFaceIndices(faceIndices);
+
+  // Add custom vector field properties to the vertex element
+  plyOut.getElement("vertex").addProperty<float>("vf_0", vf0);
+  plyOut.getElement("vertex").addProperty<float>("vf_1", vf1);
+  plyOut.getElement("vertex").addProperty<float>("vf_2", vf2);
+
+  plyOut.write(filename, happly::DataFormat::Binary);
+}
+
 
 void clearCachedSolvers() { solver.reset(); }
 
@@ -432,11 +575,11 @@ void generateRandomSourcePoints(int numPoints) {
   }
 }
 
-void smoothInterpolation() {
+VertexData<Vector2> smoothInterpolation() {
 
   if (randomSourcePoints.size() == 0) {
     polyscope::warning("no source points set");
-    return;
+    return VertexData<Vector2>{};
   }
   ensureHaveIntrinsicTriangulation();
   // Prep the data, remap to intrinsic triangulation if using
@@ -462,9 +605,11 @@ void smoothInterpolation() {
 
   VertexData<Vector3> basisX, basisY;
   std::tie(basisX, basisY) = getTangentVectors();
-  auto vectorQ = psMesh->addVertexTangentVectorQuantity("extended vectors", vectorSmooth, basisX, basisY, 1, polyscope::VectorType::AMBIENT);
+  auto vectorQ = psMesh->addVertexTangentVectorQuantity("extended vectors", vectorSmooth, basisX, basisY, 1,
+                                                        polyscope::VectorType::AMBIENT);
   vectorQ->setEnabled(true);
-  //vectorQ->setVectorLengthScale(.05);
+  // vectorQ->setVectorLengthScale(.05);
+  return vectorSmooth;
 }
 
 
@@ -770,24 +915,62 @@ void myCallback() {
     }
     if (ImGui::BeginTabItem("Smooth Interpolation")) {
       newUImode = "Smooth Interpolation";
+
+      if (randomSourcePoints.size() != 0) updateSourceSetViz(randomSourcePoints);
+
       psMesh->setSelectionMode(polyscope::MeshSelectionMode::Auto);
 
       ImGui::TextWrapped("Generate several random generators and compute smoothest vector field interpolation");
 
       ImGui::InputInt("num random vectors", &randomVectorSize);
       ImGui::InputDouble("screening weight", &screeningWeight);
-      ImGui::InputDouble("random vector scale", &randomScale);
+      ImGui::InputDouble("vector scale", &randomScale);
 
-      if (ImGui::Button("generate source points"))
-      {
+      ImGui::Checkbox("use Misha data", &useMishaData);
+
+      if (ImGui::Button("load Misha data"))
+        if (mishaSourcePoints.size() == 0)
+          polyscope::warning("no extrinsic vector data found in input ply, plz generate random data first");
+        else {
+          randomSourcePoints = mishaSourcePoints;
+          // rescale the vectors by vector scale
+          for (auto& point : randomSourcePoints) point.vectorMag *= randomScale;
+          updateSourceSetViz(randomSourcePoints);
+        }
+
+      if (ImGui::Button("generate source points")) {
         generateRandomSourcePoints(randomVectorSize);
         updateSourceSetViz(randomSourcePoints);
       }
 
-      if (ImGui::Button("compute smooth interpolation"))
-      {
-        extensionSourcePoints = randomSourcePoints;
-        smoothInterpolation();
+      if (ImGui::Button("compute smooth interpolation")) {
+        ensureHaveSolver();
+        tempVectorField = smoothInterpolation();
+      }
+
+      if (ImGui::Button("Save vector field")) {
+        if (tempVectorField.size() == 0) {
+          polyscope::warning("no vector field computed yet");
+        } else {
+          ImGui::OpenPopup("Save PLY File");
+        }
+      }
+
+      if (ImGui::BeginPopupModal("Save PLY File", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        static char saveFilename[256] = "output.ply";
+        ImGui::TextUnformatted("Enter filename to save vector field:");
+        ImGui::InputText("##filename", saveFilename, sizeof(saveFilename));
+
+        if (ImGui::Button("Save", ImVec2(120, 0))) {
+          saveVertexVector2ToPly(tempVectorField, std::string(saveFilename));
+          std::cout << "Saved vector field to: " << saveFilename << std::endl;
+          ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+          ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
       }
 
       ImGui::EndTabItem();
@@ -872,6 +1055,15 @@ int main(int argc, char** argv) {
   addVertexSite(mesh->nVertices() / 3);
 
   logmapSourceVertex = mesh->vertex(0);
+
+  // load input vector field from Misha's ply if exist
+  auto extrinsicVecs = parseVectorFieldFromPly(args::get(inputFilename));
+  if (extrinsicVecs.size() > 0) {
+    useMishaData = true;
+    std::cout << "Projecting " << extrinsicVecs.size()
+              << " extrinsic vectors from input ply onto tangent planes to create sources for extension" << std::endl;
+    mishaSourcePoints = projectExtrinsicVectors(extrinsicVecs);
+  }
 
   // Diameter estimate
   geometry->requireFaceAreas();
